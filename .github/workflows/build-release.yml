@@ -1,0 +1,318 @@
+name: Build and release
+
+# Fork pipeline: builds the Linux x86_64 and macOS arm64 bundles from this branch and, once both
+# succeed, publishes them as a GitHub release named after this repository and the built commit.
+# Unlike release.yml there is no verify gate and no unpacked macOS app among the assets.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  linux:
+    name: Linux bundle (x86_64)
+    runs-on: ubuntu-24.04
+    container:
+      image: ghcr.io/ladybirdbrowser/ladybird-ci:2026.11.12
+    timeout-minutes: 300
+    env:
+      ELARIS_BASELINE_CPU: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install bundling, headless test and LLVM tools
+        run: |
+          apt-get update -o APT::Update::Error-Mode=any
+          apt-get install -y --no-install-recommends patchelf xvfb mesa-vulkan-drivers libvulkan1 ca-certificates
+          # ./elaris setup checks for these, and the Ladybird CI image does not ship them.
+          apt-get install -y --no-install-recommends clang-tidy clang-format || true
+
+      - name: Expose the LLVM tools under their plain names
+        run: |
+          for tool in clang-tidy clang-format clangd; do
+            if command -v "$tool" >/dev/null 2>&1; then
+              continue
+            fi
+            candidate="$(ls /usr/bin/${tool}-* 2>/dev/null | sort -V | tail -1)"
+            if [ -n "$candidate" ]; then
+              ln -sf "$candidate" "/usr/local/bin/$tool"
+            fi
+          done
+          clang-tidy --version
+          clang-format --version
+
+      - name: Restore Ladybird dependency and build caches
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            .git/modules/Build/vcpkg-release
+            .git/modules/Build/caches/vcpkg-binary-cache
+            vendor/ladybird/Build
+            build/cpp-ladybird
+            target
+            build/linux
+          key: build-release-linux-x64-${{ hashFiles('vendor/ladybird/vcpkg.json', 'vendor/ladybird/vcpkg-configuration.json', 'bridge/patches/**') }}-${{ github.run_id }}
+          restore-keys: |
+            build-release-linux-x64-${{ hashFiles('vendor/ladybird/vcpkg.json', 'vendor/ladybird/vcpkg-configuration.json', 'bridge/patches/**') }}-
+            build-release-linux-x64-
+
+      - name: Name this build and record its provenance
+        run: |
+          echo "ELARIS_VERSION=${GITHUB_REF_NAME:-dev}" >> "$GITHUB_ENV"
+          # The Linux build runs as elaris-builder, so the later root steps see a checkout owned by
+          # another user and git refuses to read it. Record what packaging needs while it still can.
+          {
+            echo "ELARIS_EPOCH=$(git log -1 --format=%ct)"
+            echo "LADYBIRD_COMMIT=$(git rev-parse HEAD:vendor/ladybird)"
+            echo "RUNE_REVISION=$(grep -m1 'rev = ' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
+          } >> "$GITHUB_ENV"
+
+      - name: Set up Elaris and Ladybird
+        run: |
+          # Ladybird refuses to build as root, so build as an unprivileged user as release.yml does.
+          if ! id elaris-builder >/dev/null 2>&1; then
+            useradd --create-home --shell /bin/bash elaris-builder
+          fi
+          chown -R elaris-builder:elaris-builder "$GITHUB_WORKSPACE"
+          # The image keeps Rust under root-owned /opt and /usr/local, so rustup cannot write there.
+          for directory in "${RUSTUP_HOME:-/opt/rustup}" "${CARGO_HOME:-/usr/local/cargo}"; do
+            if [ -d "$directory" ]; then
+              chown -R elaris-builder:elaris-builder "$directory"
+            fi
+          done
+          runuser -u elaris-builder -- git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          runuser -u elaris-builder -- ./elaris setup --skip-system-deps
+
+      - name: Build and bundle Elaris
+        run: runuser -u elaris-builder -- env ELARIS_JOBS=4 ./elaris bundle
+
+      - name: Save Ladybird dependency and build caches
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            .git/modules/Build/vcpkg-release
+            .git/modules/Build/caches/vcpkg-binary-cache
+            vendor/ladybird/Build
+            build/cpp-ladybird
+            target
+            build/linux
+          key: build-release-linux-x64-${{ hashFiles('vendor/ladybird/vcpkg.json', 'vendor/ladybird/vcpkg-configuration.json', 'bridge/patches/**') }}-${{ github.run_id }}
+
+      - name: Verify the bundle's ICU data
+        run: |
+          # Text beyond ASCII goes through ICU's grapheme segmentation. A data library that the bundler
+          # rewrote makes WebContent trap on such a page, so check it before anything is published.
+          page="$RUNNER_TEMP/icu-check.html"
+          cat > "$page" <<'HTML'
+          <!doctype html><meta charset=utf-8><title>ICU check</title>
+          <p>é — 中文 — Привет — العربية — 日本語</p>
+          HTML
+          prefix=build/linux/Elaris
+          # A copy outside the build tree proves the bundle does not depend on it.
+          relocated="$RUNNER_TEMP/relocated"
+          rm -rf "$relocated" && mkdir -p "$relocated" && cp -a "$prefix" "$relocated/Elaris"
+          export LIBGL_ALWAYS_SOFTWARE=1
+          log="$RUNNER_TEMP/icu-check.log"
+          set +e
+          xvfb-run --auto-servernum "$relocated/Elaris/bin/elaris" "file://$page" -- \
+            --snap "$RUNNER_TEMP/icu-check.png" > "$log" 2>&1
+          set -e
+          if grep -q -E 'ICU error|VERIFICATION FAILED' "$log"; then
+            echo "The bundled ICU data is unusable:" >&2
+            grep -E 'ICU error|VERIFICATION FAILED' "$log" >&2
+            exit 1
+          fi
+          test -s "$RUNNER_TEMP/icu-check.png"
+
+      - name: Package the tarball and checksums
+        run: |
+          version="$ELARIS_VERSION"
+          name="Elaris-${version}-linux-x86_64"
+          mkdir -p dist
+          # Fixed owners, names and times, and no gzip name or time, so the same build always gives the same archive.
+          epoch="$ELARIS_EPOCH"
+          tar -C build/linux --sort=name --owner=0 --group=0 --numeric-owner --mtime="@${epoch}" -cf - Elaris | gzip -n > "dist/${name}.tar.gz"
+          cat > "dist/${name}.BUILD-INFO.txt" <<EOF
+          Elaris ${version} (Linux x86_64)
+          Elaris commit: ${GITHUB_SHA}
+          Ladybird commit: ${LADYBIRD_COMMIT}
+          Rune revision: ${RUNE_REVISION}
+          Container: ghcr.io/ladybirdbrowser/ladybird-ci:2026.11.12
+          EOF
+          (cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256")
+
+      - name: Keep the install prefix even if packaging failed
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: elaris-linux-x86_64-build
+          path: build/linux/Elaris
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: elaris-linux-x86_64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+
+  macos:
+    name: macOS bundle (Apple Silicon)
+    # macos-26 jobs are cancelled before they start while its arm64 pool is starved; macos-15 runs Xcode 26 too.
+    runs-on: macos-15
+    timeout-minutes: 300
+    env:
+      ELARIS_BASELINE_CPU: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Select the newest Xcode 26
+        run: |
+          # macos-15 defaults to Xcode 16, but the image installs the 26.x toolchains beside it.
+          app="$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)"
+          if [ -z "$app" ]; then
+            echo "Xcode 26 or newer is required" >&2
+            ls /Applications >&2
+            exit 1
+          fi
+          sudo xcode-select -s "$app/Contents/Developer"
+          echo "DEVELOPER_DIR=$app/Contents/Developer" >> "$GITHUB_ENV"
+          xcodebuild -version
+
+      - name: Restore Ladybird dependency and build caches
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            .git/modules/Build/vcpkg-release
+            .git/modules/Build/caches/vcpkg-binary-cache
+            vendor/ladybird/Build
+            build/cpp-ladybird
+            target
+            build/Elaris.app
+            build/Elaris.app.stamp
+          key: build-release-macos-${{ hashFiles('vendor/ladybird/vcpkg.json', 'vendor/ladybird/vcpkg-configuration.json', 'bridge/patches/**') }}-${{ github.run_id }}
+          restore-keys: |
+            build-release-macos-${{ hashFiles('vendor/ladybird/vcpkg.json', 'vendor/ladybird/vcpkg-configuration.json', 'bridge/patches/**') }}-
+            build-release-macos-
+
+      - name: Name this build and record its provenance
+        run: |
+          echo "ELARIS_VERSION=${GITHUB_REF_NAME:-dev}" >> "$GITHUB_ENV"
+          # The Linux build runs as elaris-builder, so the later root steps see a checkout owned by
+          # another user and git refuses to read it. Record what packaging needs while it still can.
+          {
+            echo "ELARIS_EPOCH=$(git log -1 --format=%ct)"
+            echo "LADYBIRD_COMMIT=$(git rev-parse HEAD:vendor/ladybird)"
+            echo "RUNE_REVISION=$(grep -m1 'rev = ' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
+          } >> "$GITHUB_ENV"
+
+      - name: Set up Elaris and Ladybird
+        run: ./elaris setup
+
+      - name: Build and bundle Elaris
+        run: ./elaris bundle
+
+      - name: Save Ladybird dependency and build caches
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            .git/modules/Build/vcpkg-release
+            .git/modules/Build/caches/vcpkg-binary-cache
+            vendor/ladybird/Build
+            build/cpp-ladybird
+            target
+            build/Elaris.app
+            build/Elaris.app.stamp
+          key: build-release-macos-${{ hashFiles('vendor/ladybird/vcpkg.json', 'vendor/ladybird/vcpkg-configuration.json', 'bridge/patches/**') }}-${{ github.run_id }}
+
+      - name: Verify the bundle is self-contained
+        run: |
+          app=build/Elaris.app
+          codesign --verify --deep --strict "$app"
+          plutil -lint "$app/Contents/Info.plist"
+          if otool -l "$app/Contents/MacOS/elaris" | grep -q "$GITHUB_WORKSPACE"; then
+            echo "The bundle still points into the build tree" >&2
+            exit 1
+          fi
+
+      - name: Package a disk image and checksums
+        run: |
+          version="$ELARIS_VERSION"
+          name="Elaris-${version}-macos-arm64"
+          mkdir -p dist
+          brew install create-dmg
+          packaging/macos/make-dmg.sh build/Elaris.app "dist/${name}.dmg" Elaris
+          cat > "dist/${name}.BUILD-INFO.txt" <<EOF
+          Elaris ${version} (macOS arm64)
+          Elaris commit: ${GITHUB_SHA}
+          Ladybird commit: ${LADYBIRD_COMMIT}
+          Rune revision: ${RUNE_REVISION}
+          Xcode: $(xcodebuild -version | tr '\n' ' ')
+          EOF
+          (cd dist && shasum -a 256 "${name}.dmg" > "${name}.dmg.sha256")
+
+      - name: Keep the app bundle even if packaging failed
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: elaris-macos-arm64-build
+          path: build/Elaris.app
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: elaris-macos-arm64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish release
+    needs: [linux, macos]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.sha }}
+          BRANCH: ${{ github.ref_name }}
+          REPOSITORY_NAME: ${{ github.event.repository.name }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          short="${SHA:0:7}"
+          branch="${BRANCH//\//-}"
+          tag="build-${branch}-${short}"
+          # A rebuild of the same commit replaces its release instead of failing on the existing tag.
+          gh release delete "$tag" --cleanup-tag --yes 2>/dev/null || true
+          gh release create "$tag" dist/* \
+            --target "$SHA" \
+            --title "${REPOSITORY_NAME} ${short}" \
+            --notes "Automatic build of ${BRANCH} at ${short}
+
+          Elaris commit: ${SHA}
+          Built from ${BRANCH} by run ${GITHUB_RUN_ID}. Assets: Linux x86_64 tarball and macOS arm64 disk image, each with its .sha256 and BUILD-INFO.txt."
+          echo "Published ${tag}" >> "$GITHUB_STEP_SUMMARY"
