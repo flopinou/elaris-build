@@ -292,6 +292,12 @@ def linux_prefix_bundle(executable: Path, prefix: Path, *, fresh: bool = False) 
     run_path.update({prefix / "libexec" / helper.name: "$ORIGIN/../lib" for helper in helpers})
     run_path.update({library: "$ORIGIN" for library in library_directory.iterdir() if library.is_file()})
     for binary, origin in run_path.items():
+        # ICU's data library holds its whole payload in one symbol that points into .rodata. A patchelf
+        # rewrite relocates that section and leaves the symbol naming filler bytes, so ICU then finds no
+        # data at runtime (U_MISSING_RESOURCE_ERROR) and WebContent traps on any page with non-ASCII text.
+        # The library has no dependencies of its own, so it does not need the RUNPATH we would set here.
+        if binary.name.startswith("libicudata."):
+            continue
         subprocess.run(["patchelf", "--set-rpath", origin, str(binary)], check=True)
     _verify_linux_prefix(prefix)
     return installed
