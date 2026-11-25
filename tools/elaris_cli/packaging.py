@@ -25,19 +25,9 @@ APP_ICON_SOURCES = {
 }
 # The flat bitmap the brand kit already exports, used when actool cannot render the Icon Composer document.
 APP_ICON_FALLBACK = ROOT / "assets" / "brand-kit" / "native-app" / "ios" / "AppIcon.appiconset" / "AppIcon-1024.png"
-# What iconutil expects in an .iconset, largest first so sips only ever shrinks the 1024px master.
-ICONSET_IMAGES = (
-    ("icon_512x512@2x.png", 1024),
-    ("icon_512x512.png", 512),
-    ("icon_256x256@2x.png", 512),
-    ("icon_256x256.png", 256),
-    ("icon_128x128@2x.png", 256),
-    ("icon_128x128.png", 128),
-    ("icon_32x32@2x.png", 64),
-    ("icon_32x32.png", 32),
-    ("icon_16x16@2x.png", 32),
-    ("icon_16x16.png", 16),
-)
+# The .icns rendition tags macOS asks for, largest first. The container is written directly because iconutil refuses
+# a PNG without an alpha channel and the brand's export is opaque.
+ICNS_RENDITIONS = ((b"ic10", 1024), (b"ic09", 512), (b"ic08", 256))
 APP_ID = "org.elarisbrowser.Elaris"
 ENGINE_BUILD = ROOT / "build" / "cpp-ladybird"
 LADYBIRD_APP = ENGINE_BUILD / "bin" / "Ladybird.app"
@@ -64,16 +54,21 @@ def _copy_if_changed(source: Path, destination: Path) -> bool:
     return True
 
 
+def _icns(renditions: list[tuple[bytes, bytes]]) -> bytes:
+    """An .icns container: a header, then one PNG per rendition tag, each with its length including its header."""
+    body = b"".join(kind + (len(payload) + 8).to_bytes(4, "big") + payload for kind, payload in renditions)
+    return b"icns" + (len(body) + 8).to_bytes(4, "big") + body
+
+
 def _macos_flat_icon(output: Path) -> None:
-    """Render Icon.icns from the brand's 1024px export, for hosts whose actool cannot read the Icon Composer document."""
-    iconset = output / "Icon.iconset"
-    if iconset.exists():
-        shutil.rmtree(iconset)
-    iconset.mkdir(parents=True)
-    for name, size in ICONSET_IMAGES:
-        run("sips", "-z", str(size), str(size), str(APP_ICON_FALLBACK), "--out", str(iconset / name))
-    run("iconutil", "--convert", "icns", str(iconset), "--output", str(output / "Icon.icns"))
-    shutil.rmtree(iconset)
+    """Write Icon.icns from the brand's 1024px export, for hosts whose actool cannot read the Icon Composer document."""
+    renditions = []
+    for kind, size in ICNS_RENDITIONS:
+        rendition = output / f"icon-{size}.png"
+        run("sips", "-z", str(size), str(size), str(APP_ICON_FALLBACK), "--out", str(rendition))
+        renditions.append((kind, rendition.read_bytes()))
+        rendition.unlink()
+    (output / "Icon.icns").write_bytes(_icns(renditions))
 
 
 def _macos_app_icon(channel: str) -> Path:
@@ -119,11 +114,17 @@ def _macos_app_icon(channel: str) -> Path:
     return output
 
 
-def _macos_info_plist(channel: str) -> Path:
-    """The Info.plist with the build's channel under `ElarisChannel`, rewritten only when it changes."""
+def _macos_info_plist(channel: str, *, icon_catalog: bool = True) -> Path:
+    """The Info.plist with the build's channel under `ElarisChannel`, rewritten only when it changes.
+
+    `icon_catalog` is False when the host could not compile Assets.car: the plist then names only Icon.icns, so
+    macOS does not look for an icon the bundle does not carry.
+    """
     with (PACKAGING / "macos" / "Info.plist").open("rb") as source:
         info = plistlib.load(source)
     info["ElarisChannel"] = channel
+    if not icon_catalog:
+        info.pop("CFBundleIconName", None)
     output = ROOT / "build" / "macos" / f"Info-{channel}.plist"
     rendered = plistlib.dumps(info)
     if not output.is_file() or output.read_bytes() != rendered:
@@ -136,7 +137,9 @@ def _macos_bundle_metadata(contents: Path, channel: str) -> bool:
     """Copy the channel's Info.plist and compiled icon into an app's Contents. Returns whether anything changed."""
     icon = _macos_app_icon(channel)
     # Xcode stopped emitting Icon.icns beside Assets.car, and macOS 26 reads the icon from the catalog.
-    sources = [(_macos_info_plist(channel), contents / "Info.plist")]
+    sources = [
+        (_macos_info_plist(channel, icon_catalog=(icon / "Assets.car").is_file()), contents / "Info.plist"),
+    ]
     for name in ("Assets.car", "Icon.icns"):
         if (icon / name).is_file():
             sources.append((icon / name, contents / "Resources" / name))
