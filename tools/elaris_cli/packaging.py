@@ -22,6 +22,21 @@ APP_ICON_SOURCES = {
     "dev": APP_ICONS / "Icon-Dev.icon",
     "canary": APP_ICONS / "Icon-Dev.icon",
 }
+# The flat bitmap the brand kit already exports, used when actool cannot render the Icon Composer document.
+APP_ICON_FALLBACK = ROOT / "assets" / "brand-kit" / "native-app" / "ios" / "AppIcon.appiconset" / "AppIcon-1024.png"
+# What iconutil expects in an .iconset, largest first so sips only ever shrinks the 1024px master.
+ICONSET_IMAGES = (
+    ("icon_512x512@2x.png", 1024),
+    ("icon_512x512.png", 512),
+    ("icon_256x256@2x.png", 512),
+    ("icon_256x256.png", 256),
+    ("icon_128x128@2x.png", 256),
+    ("icon_128x128.png", 128),
+    ("icon_32x32@2x.png", 64),
+    ("icon_32x32.png", 32),
+    ("icon_16x16@2x.png", 32),
+    ("icon_16x16.png", 16),
+)
 APP_ID = "org.elarisbrowser.Elaris"
 ENGINE_BUILD = ROOT / "build" / "cpp-ladybird"
 LADYBIRD_APP = ENGINE_BUILD / "bin" / "Ladybird.app"
@@ -48,13 +63,25 @@ def _copy_if_changed(source: Path, destination: Path) -> bool:
     return True
 
 
+def _macos_flat_icon(output: Path) -> None:
+    """Render Icon.icns from the brand's 1024px export, for hosts whose actool cannot read the Icon Composer document."""
+    iconset = output / "Icon.iconset"
+    if iconset.exists():
+        shutil.rmtree(iconset)
+    iconset.mkdir(parents=True)
+    for name, size in ICONSET_IMAGES:
+        run("sips", "-z", str(size), str(size), str(APP_ICON_FALLBACK), "--out", str(iconset / name))
+    run("iconutil", "--convert", "icns", str(iconset), "--output", str(output / "Icon.icns"))
+    shutil.rmtree(iconset)
+
+
 def _macos_app_icon(channel: str) -> Path:
-    """Compile the channel's icon into Assets.car (macOS 26+) and Icon.icns (older systems), cached under build/."""
+    """Compile the channel's icon into Assets.car (and Icon.icns when actool still emits one), cached under build/."""
     source = APP_ICON_SOURCES[channel]
     output = ROOT / "build" / "icons" / "macos" / source.stem
-    compiled = [output / "Assets.car", output / "Icon.icns"]
     newest_source = max(path.stat().st_mtime_ns for path in source.rglob("*") if path.is_file())
-    if all(path.is_file() and path.stat().st_mtime_ns >= newest_source for path in compiled):
+    compiled = [path for path in (output / "Assets.car", output / "Icon.icns") if path.is_file()]
+    if compiled and min(path.stat().st_mtime_ns for path in compiled) >= newest_source:
         return output
 
     # actool names the icon after its document, and Info.plist expects "Icon", so compile a copy by that name.
@@ -62,19 +89,32 @@ def _macos_app_icon(channel: str) -> Path:
     if staged.parent.exists():
         shutil.rmtree(staged.parent)
     shutil.copytree(source, staged)
-    run(
-        "xcrun", "actool", str(staged),
-        "--compile", str(output),
-        "--output-partial-info-plist", str(output / "partial-info.plist"),
-        "--app-icon", "Icon",
-        "--platform", "macosx",
-        "--target-device", "mac",
-        "--minimum-deployment-target", "26.0",
-        "--development-region", "en",
-        "--enable-on-demand-resources", "NO",
-        "--output-format", "human-readable-text",
-        "--errors", "--warnings",
+    # actool renders the document through an asset runtime agent that loads the host's frameworks; on macOS 15
+    # that agent dies on the symbols macOS 26 added. Lightweight mode uses the runtime bundled with Xcode instead.
+    result = subprocess.run(
+        (
+            "xcrun", "actool", str(staged),
+            "--compile", str(output),
+            "--output-partial-info-plist", str(output / "partial-info.plist"),
+            "--app-icon", "Icon",
+            "--platform", "macosx",
+            "--target-device", "mac",
+            "--minimum-deployment-target", "26.0",
+            "--development-region", "en",
+            "--enable-on-demand-resources", "NO",
+            "--output-format", "human-readable-text",
+            "--lightweight-asset-runtime-mode=enabled",
+            "--errors", "--warnings",
+        ),
+        cwd=ROOT,
+        check=False,
     )
+    assets = output / "Assets.car"
+    if result.returncode or not assets.is_file():
+        # Keep a release shippable on hosts Xcode 26 no longer supports for Icon Composer documents.
+        assets.unlink(missing_ok=True)
+        ui.warning(f"actool could not compile {source.name}; falling back to the brand's flat 1024px icon")
+        _macos_flat_icon(output)
     return output
 
 
@@ -94,12 +134,13 @@ def _macos_info_plist(channel: str) -> Path:
 def _macos_bundle_metadata(contents: Path, channel: str) -> bool:
     """Copy the channel's Info.plist and compiled icon into an app's Contents. Returns whether anything changed."""
     icon = _macos_app_icon(channel)
+    # Xcode stopped emitting Icon.icns beside Assets.car, and macOS 26 reads the icon from the catalog.
+    sources = [(_macos_info_plist(channel), contents / "Info.plist")]
+    for name in ("Assets.car", "Icon.icns"):
+        if (icon / name).is_file():
+            sources.append((icon / name, contents / "Resources" / name))
     changed = False
-    for source, destination in (
-        (_macos_info_plist(channel), contents / "Info.plist"),
-        (icon / "Assets.car", contents / "Resources" / "Assets.car"),
-        (icon / "Icon.icns", contents / "Resources" / "Icon.icns"),
-    ):
+    for source, destination in sources:
         changed |= _copy_if_changed(source, destination)
     return changed
 
