@@ -5,6 +5,7 @@ import plistlib
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 from . import engine, ui
@@ -298,7 +299,15 @@ def linux_prefix_bundle(executable: Path, prefix: Path, *, fresh: bool = False) 
     installed = prefix / "bin" / executable.name
     helpers = sorted(path for path in (ENGINE_BUILD / "libexec").iterdir() if path.is_file())
     library_directory = prefix / "lib"
-    if not fresh and _linux_engine_key() == _read_stamp(LINUX_BUNDLE_STAMP) and installed.parent.is_dir():
+    reuse = not fresh and _linux_engine_key() == _read_stamp(LINUX_BUNDLE_STAMP) and installed.parent.is_dir()
+    if reuse:
+        # A prefix restored from a cache can hold a library whose payload an earlier tool destroyed, and the stamp
+        # would carry it straight into a release. Rebuild the prefix when its ICU data cannot serve a page.
+        boundaries, failure = _linux_icu_boundaries(library_directory)
+        if not boundaries:
+            ui.warning(f"Rebuilding the bundle: {failure}")
+            reuse = False
+    if reuse:
         # The engine did not change, so the prefix stays and only Elaris's executable and any libraries it newly needs
         # are refreshed. Its helpers and resources are the same files as before.
         shutil.copy2(executable, installed)
@@ -347,9 +356,76 @@ def linux_prefix_bundle(executable: Path, prefix: Path, *, fresh: bool = False) 
 # What the last full Linux prefix was assembled from. A matching key lets the next bundle skip the engine copy.
 LINUX_BUNDLE_STAMP = ROOT / "build" / "linux" / "Elaris.stamp"
 
+# Grapheme segmentation is what WebContent runs ICU for on every page with non-ASCII text, so it is the cheapest
+# way to tell whether the data library a bundle ships is usable. The probe must run in its own interpreter: the
+# loader keeps the first copy of a library it loads, and a discarded prefix is replaced by a rebuilt one.
+LINUX_ICU_PROBE = r'''
+import ctypes
+import glob
+import sys
+
+directory = sys.argv[1]
+
+
+def find(pattern):
+    matches = sorted(glob.glob(f"{directory}/{pattern}"))
+    return matches[0] if matches else None
+
+
+data, common, international = find("libicudata.so.*"), find("libicuuc.so.*"), find("libicui18n.so.*")
+if not (data and common and international):
+    sys.exit("the bundle does not ship ICU")
+revision = data.rsplit(".so.", 1)[-1].split(".")[0]
+ctypes.CDLL(data, mode=ctypes.RTLD_GLOBAL)
+ctypes.CDLL(common, mode=ctypes.RTLD_GLOBAL)
+library = ctypes.CDLL(international, mode=ctypes.RTLD_GLOBAL)
+
+
+def symbol(name):
+    return getattr(library, f"{name}_{revision}", None) or getattr(library, name)
+
+
+open_iterator, first, following, close = (symbol(name) for name in ("ubrk_open", "ubrk_first", "ubrk_next", "ubrk_close"))
+open_iterator.restype = ctypes.c_void_p
+open_iterator.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_int32, ctypes.POINTER(ctypes.c_int)]
+first.restype = following.restype = ctypes.c_int32
+first.argtypes = following.argtypes = [ctypes.c_void_p]
+close.argtypes = [ctypes.c_void_p]
+
+encoded = "é — 中文 — Привет — العربية".encode("utf-16-le")
+text = (ctypes.c_uint16 * (len(encoded) // 2)).from_buffer_copy(encoded)
+status = ctypes.c_int(0)
+iterator = open_iterator(0, b"en", ctypes.cast(text, ctypes.c_void_p), len(text), ctypes.byref(status))
+if not iterator or status.value > 0:
+    sys.exit(f"ICU cannot open a character break iterator (UErrorCode {status.value})")
+boundaries, position = 0, first(iterator)
+while position != -1:
+    boundaries += 1
+    position = following(iterator)
+close(iterator)
+print(boundaries)
+'''
+
 
 def _read_stamp(path: Path) -> str:
     return path.read_text() if path.is_file() else ""
+
+
+def _linux_icu_boundaries(library_directory: Path) -> tuple[int, str]:
+    """Count the grapheme boundaries ICU finds in sample text using the libraries this prefix ships.
+
+    Returns the count and, when it is zero, what went wrong. Zero means WebContent would fail to lay out any page
+    with non-ASCII text, which is what a data library whose payload was lost looks like.
+    """
+    result = subprocess.run(
+        [sys.executable, "-c", LINUX_ICU_PROBE, str(library_directory)],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip().splitlines()
+        return 0, detail[-1] if detail else "the ICU probe failed"
+    return int(result.stdout.strip() or 0), ""
 
 
 def _linux_engine_key() -> str:
@@ -361,7 +437,8 @@ def _linux_engine_key() -> str:
 
 
 def _verify_linux_prefix(prefix: Path) -> None:
-    """Fail if a binary's RUNPATH still names the build tree, since the bundle must run from anywhere."""
+    """Fail if a binary's RUNPATH still names the build tree, since the bundle must run from anywhere, or if the
+    bundled ICU data cannot serve a break iterator, since then no page with non-ASCII text could load."""
     for binary in sorted(path for path in prefix.rglob("*") if path.is_file() and not path.is_symlink()):
         if subprocess.run(["readelf", "-h", str(binary)], capture_output=True).returncode != 0:
             continue
@@ -369,3 +446,6 @@ def _verify_linux_prefix(prefix: Path) -> None:
         for runpath in re.findall(r"\((?:RUNPATH|RPATH)\)\s+Library (?:runpath|rpath): \[([^\]]*)\]", output):
             if any(entry.startswith("/") for entry in runpath.split(":")):
                 raise SystemExit(f"elaris: {binary.relative_to(prefix)} still has an absolute RUNPATH: {runpath}")
+    boundaries, failure = _linux_icu_boundaries(prefix / "lib")
+    if not boundaries:
+        raise SystemExit(f"elaris: the bundled ICU data is unusable: {failure}")
