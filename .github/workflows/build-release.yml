@@ -62,10 +62,10 @@ jobs:
             build/cpp-ladybird
             target
             build/linux
-          key: build-release-linux-x64-${{ hashFiles('vendor/ladybird/vcpkg.json', 'vendor/ladybird/vcpkg-configuration.json', 'bridge/patches/**') }}-${{ github.run_id }}
+          key: build-release-linux-x64-v2-${{ hashFiles('vendor/ladybird/vcpkg.json', 'vendor/ladybird/vcpkg-configuration.json', 'bridge/patches/**') }}-${{ github.run_id }}
           restore-keys: |
-            build-release-linux-x64-${{ hashFiles('vendor/ladybird/vcpkg.json', 'vendor/ladybird/vcpkg-configuration.json', 'bridge/patches/**') }}-
-            build-release-linux-x64-
+            build-release-linux-x64-v2-${{ hashFiles('vendor/ladybird/vcpkg.json', 'vendor/ladybird/vcpkg-configuration.json', 'bridge/patches/**') }}-
+            build-release-linux-x64-v2-
 
       - name: Name this build and record its provenance
         run: |
@@ -97,6 +97,15 @@ jobs:
       - name: Build and bundle Elaris
         run: runuser -u elaris-builder -- env ELARIS_JOBS=4 ./elaris bundle
 
+      - name: Audit the ICU data in the build tree
+        if: always()
+        run: |
+          # A cached data library a previous run's patchelf rewrote keeps its payload nowhere the symbol points.
+          # Name every copy and show the payload's first bytes (0x5a repeated means the section was abandoned).
+          while IFS= read -r library; do
+            printf '%s %s %s %s\n' "$(sha256sum "$library" | cut -d' ' -f1)" "$(stat -c %s "$library")" "$(xxd -s 0x2a0 -l 8 -p "$library")" "$library"
+          done < <(find . -name 'libicudata.so.*' -type f -not -path './.git/*' | sort)
+
       - name: Save Ladybird dependency and build caches
         if: always()
         uses: actions/cache/save@v4
@@ -108,7 +117,7 @@ jobs:
             build/cpp-ladybird
             target
             build/linux
-          key: build-release-linux-x64-${{ hashFiles('vendor/ladybird/vcpkg.json', 'vendor/ladybird/vcpkg-configuration.json', 'bridge/patches/**') }}-${{ github.run_id }}
+          key: build-release-linux-x64-v2-${{ hashFiles('vendor/ladybird/vcpkg.json', 'vendor/ladybird/vcpkg-configuration.json', 'bridge/patches/**') }}-${{ github.run_id }}
 
       - name: Verify the bundle's ICU data
         run: |

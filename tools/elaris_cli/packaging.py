@@ -352,6 +352,8 @@ def linux_prefix_bundle(executable: Path, prefix: Path, *, fresh: bool = False) 
         if binary.name.startswith("libicudata."):
             continue
         subprocess.run(["patchelf", "--set-rpath", origin, str(binary)], check=True)
+    if not _linux_icu_boundaries(library_directory)[0]:
+        _replace_linux_icu_data(prefix)
     _verify_linux_prefix(prefix)
     return installed
 
@@ -437,6 +439,29 @@ def _linux_engine_key() -> str:
     bridge = list((ENGINE_BUILD / "lib").glob("libelaris_ladybird.*"))
     newest = max((path.stat().st_mtime_ns for path in helpers + bridge), default=0)
     return f"{engine.dependencies_fingerprint()} {newest}"
+
+
+def _replace_linux_icu_data(prefix: Path) -> bool:
+    """Swap the bundled ICU data library for a usable copy from a build directory, when one still has it.
+
+    A prefix restored from a cache can hold a data library an earlier patchelf moved: the address its symbol names
+    is filled with filler bytes while the payload sits where nothing reads it. Prefer the intact copy the build tree
+    kept over failing the whole build.
+    """
+    bundled = sorted((prefix / "lib").glob("libicudata.so.*"))
+    if not bundled:
+        return False
+    target = bundled[0]
+    for directory in _linux_search_directories():
+        candidate = directory / target.name
+        if not candidate.is_file() or candidate.resolve() == target.resolve():
+            continue
+        shutil.copyfile(candidate, target)
+        shutil.copymode(candidate, target)
+        if _linux_icu_boundaries(prefix / "lib")[0]:
+            ui.warning(f"Replaced {target.name} with the copy in {candidate.parent}: the bundled one was unusable")
+            return True
+    return False
 
 
 def _verify_linux_prefix(prefix: Path) -> None:
